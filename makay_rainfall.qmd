@@ -1,0 +1,906 @@
+---
+title: "Rainfall data for the Makay protected area, Madagascar"
+subtitle: "Source accessibility, station coverage and the November 2019 to October 2020 window"
+date: today
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+  typst:
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+## Purpose
+
+This document assesses three sources of rainfall data for southwestern Madagascar and looks at the observed station records closest to the Makay protected area. The main focus is the period November 2019 to October 2020. For that period the station records are compared across sources and cross-checked against WorldClim. Gridded or modelled products are reported but do not enter the station analysis.
+
+Sources assessed:
+
+- NOAA Global Historical Climatology Network-Daily (GHCN-Daily)
+- Meteostat
+- Meteo Madagascar climate data library (IRI Data Library, map.meteomadagascar.mg)
+
+Cross-check:
+
+- WorldClim 2.1 historical monthly precipitation (CRU TS 4.09 based, 5 arc-minute) and the 1970-2000 normals (30 arc-second)
+
+## Study area
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(terra)
+library(geodata)
+library(rnaturalearth)
+library(ggrepel)
+library(wdpar)
+library(httr2)
+library(jsonlite)
+library(knitr)
+library(paws.storage)
+
+raw_dir <- "data/raw"
+dir.create(raw_dir, recursive = TRUE, showWarnings = FALSE)
+
+# UTM zone 38S: metric distances in southern Madagascar
+utm_crs <- 32738
+radius_km <- 400
+clim_years <- 1991:2020
+n_clim_days <- as.numeric(as.Date("2021-01-01") - as.Date("1991-01-01"))
+
+focus_wmo <- c(Ranohira = "67152", Morondava = "67117", Morombe = "67131")
+focus_months <- seq(as.Date("2019-11-01"), as.Date("2020-10-01"), by = "month")
+focus_end <- max(focus_months) %m+% months(1)
+# English month labels, independent of the session locale
+mlab <- \(x) paste(month.abb[month(x)], year(x))
+
+fetch <- function(url, dest) {
+  if (!file.exists(dest)) {
+    request(url) |>
+      req_timeout(600) |>
+      req_retry(max_tries = 3) |>
+      req_perform(path = dest)
+  }
+  dest
+}
+```
+
+The WDPA/WD-OECM Nov 2026 release was downloaded manually, because `wdpa_fetch()` failed: its `wdpa_url()` step scrapes protectedplanet.net with a headless browser and the page structure no longer matches. `wdpa_read()` reads the local zip directly.
+
+```{r}
+#| label: wdpa
+wdpa_zip <- "WDPA_WDOECM_Nov2026_Public_MDG.zip"
+stopifnot(file.exists(wdpa_zip))
+
+mdg_pa <- wdpa_read(wdpa_zip)
+makay <- mdg_pa |> filter(NAME == "Makay")
+stopifnot(nrow(makay) == 1)
+
+makay_utm <- makay |> st_transform(utm_crs) |> st_union()
+makay_label <- st_point_on_surface(makay)
+
+mdg_border <- ne_countries(country = "Madagascar", scale = "medium", returnclass = "sf")
+
+makay |>
+  st_drop_geometry() |>
+  transmute(
+    Name = NAME,
+    Designation = DESIG_ENG,
+    Status = STATUS,
+    `Status year` = STATUS_YR,
+    `IUCN category` = IUCN_CAT,
+    Governance = GOV_TYPE,
+    `Reported area (km2)` = REP_AREA,
+    `Computed area (km2)` = round(as.numeric(st_area(makay_utm)) / 1e6, 1)
+  ) |>
+  kable(caption = "Makay in the WDPA/WD-OECM Nov 2026 release.")
+```
+
+The file `Alentours_Makay_PRJ_WGS84.kml` at the repository root holds a wider "Alentours Makay" outline (a roughly rectangular buffer around the massif): about 14,300 km2, containing about 97% of the WDPA Makay polygon, with the southern tip of the massif left outside. It carries no attribute fields. It is read once and drawn on the maps as a dashed outline alongside the WDPA boundary.
+
+```{r}
+#| label: alentours
+alentours_file <- "Alentours_Makay_PRJ_WGS84.kml"
+stopifnot(file.exists(alentours_file))
+
+alentours <- st_read(alentours_file, quiet = TRUE) |> st_make_valid()
+
+alentours |> st_drop_geometry() |> kable(caption = "Fields in the Alentours Makay KML (none set).")
+```
+
+```{r}
+#| label: fig-makay-map
+#| fig-cap: "The Makay boundary (WDPA Nov 2026, status Proposed, grey) and the Alentours Makay outline (blue dashed), with Madagascar's national border, in the study box used for the later maps."
+#| fig-height: 5
+ggplot() +
+  geom_sf(data = mdg_border, fill = "grey97", color = "grey40", linewidth = 0.3) +
+  geom_sf(data = alentours, fill = NA, color = "#2b6cb0", linetype = "dashed", linewidth = 0.5) +
+  geom_sf(data = makay, fill = "grey85", color = "grey30") +
+  geom_sf_text(data = makay_label, aes(label = NAME), size = 3) +
+  coord_sf(xlim = c(42.9, 46), ylim = c(-23.3, -19.8), expand = FALSE) +
+  labs(x = NULL, y = NULL)
+```
+
+## Accessibility check
+
+Each endpoint is tested with a HEAD request. A status of 200 means the resource answered; it does not confirm the data content, which is checked further below.
+
+```{r}
+#| label: tbl-endpoints
+#| tbl-cap: "HTTP status of each source endpoint, tested at the time of the analysis."
+check_url <- function(url) {
+  tryCatch(
+    request(url) |>
+      req_method("HEAD") |>
+      req_timeout(60) |>
+      req_error(is_error = \(resp) FALSE) |>
+      req_perform() |>
+      resp_status(),
+    error = \(e) NA_integer_
+  )
+}
+
+endpoints <- tribble(
+  ~source, ~resource, ~url,
+  "GHCN-Daily", "Station list", "https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt",
+  "GHCN-Daily", "Inventory by element", "https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-inventory.txt",
+  "GHCN-Daily", "Per-station CSV (Ranohira)", "https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/MAM00067152.csv",
+  "Meteostat", "Station index (bulk JSON)", "https://bulk.meteostat.net/v2/stations/full.json.gz",
+  "Meteostat", "Daily bulk file (Ranohira)", "https://bulk.meteostat.net/v2/daily/67152.csv.gz",
+  "Meteo Madagascar", "IRI data library home", "https://map.meteomadagascar.mg/",
+  "Meteo Madagascar", "Monthly rainfall branch", "https://map.meteomadagascar.mg/SOURCES/.Madagascar_v3/.ALL/.monthly/.rainfall/",
+  "WorldClim", "Historical monthly precipitation 2010-2019 (5 arc-min)", "https://geodata.ucdavis.edu/climate/worldclim/2_1/hist/cts4.09/wc2.1_cruts4.09_5m_prec_2010-2019.zip"
+)
+
+endpoints |>
+  mutate(http_status = map_int(url, check_url)) |>
+  select(source, resource, http_status, url) |>
+  kable()
+```
+
+### Station metadata
+
+Both station indexes are downloaded in full and filtered to Madagascar. GHCN-Daily is filtered to stations with a PRCP record in the inventory.
+
+```{r}
+#| label: station-indexes
+ghcn_stations_file <- fetch(
+  "https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt",
+  file.path(raw_dir, "ghcnd-stations.txt")
+)
+ghcn_inventory_file <- fetch(
+  "https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-inventory.txt",
+  file.path(raw_dir, "ghcnd-inventory.txt")
+)
+meteostat_index_file <- fetch(
+  "https://bulk.meteostat.net/v2/stations/full.json.gz",
+  file.path(raw_dir, "meteostat-stations-full.json.gz")
+)
+
+ghcn_stations <- read_fwf(
+  ghcn_stations_file,
+  fwf_positions(c(1, 13, 22, 32, 42), c(11, 20, 30, 37, 71),
+    col_names = c("id", "lat", "lon", "elev", "name")
+  ),
+  show_col_types = FALSE
+)
+
+ghcn_prcp <- read_fwf(
+  ghcn_inventory_file,
+  fwf_positions(c(1, 32, 37, 42), c(11, 35, 40, 45),
+    col_names = c("id", "element", "first_year", "last_year")
+  ),
+  show_col_types = FALSE
+) |>
+  filter(element == "PRCP")
+
+ms_index <- fromJSON(
+  paste(readLines(gzfile(meteostat_index_file), warn = FALSE), collapse = ""),
+  flatten = TRUE
+)
+```
+
+```{r}
+#| label: candidate-stations
+dist_to_pa_km <- function(df) {
+  pts <- st_as_sf(df, coords = c("lon", "lat"), crs = 4326) |>
+    st_transform(utm_crs)
+  df |>
+    mutate(dist_km = as.numeric(st_distance(pts, makay_utm)) / 1000)
+}
+
+ghcn_candidates <- ghcn_stations |>
+  filter(str_starts(id, "MA")) |>
+  inner_join(ghcn_prcp, by = "id") |>
+  transmute(
+    source = "GHCN-Daily",
+    station_id = id,
+    wmo = str_sub(id, -5),
+    name = str_to_title(str_trim(name)),
+    lon, lat, elev,
+    first_year, last_year
+  ) |>
+  dist_to_pa_km()
+
+ms_candidates <- ms_index |>
+  filter(country == "MG", str_detect(id, "^[0-9]{5}$"), !is.na(inventory.daily.start)) |>
+  transmute(
+    source = "Meteostat",
+    station_id = id,
+    wmo = id,
+    name = name.en,
+    lon = location.longitude,
+    lat = location.latitude,
+    elev = location.elevation,
+    first_year = year(as.Date(inventory.daily.start)),
+    last_year = year(as.Date(inventory.daily.end))
+  ) |>
+  dist_to_pa_km()
+
+station_meta <- bind_rows(ghcn_candidates, ms_candidates) |>
+  filter(dist_km <= radius_km) |>
+  arrange(dist_km)
+
+station_meta |>
+  transmute(
+    Source = source,
+    Station = name,
+    `ID` = station_id,
+    `Distance to Makay (km)` = round(dist_km),
+    `Elevation (m)` = elev,
+    `Record start` = first_year,
+    `Record end (metadata)` = last_year
+  ) |>
+  kable(caption = "Stations within 400 km of the Makay boundary, by source. Distances are measured from the boundary, not the centroid.")
+```
+
+Beroroha, the station mentioned in the brief, does not appear in either index for Madagascar, so no station record is available for it from these sources. The three stations closest to Makay, Ranohira, Morondava and Morombe, are the focus of the rest of the document.
+
+```{r}
+#| label: station-points
+set.seed(4817)
+station_pts <- station_meta |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE) |>
+  st_transform(utm_crs) |>
+  # Jitter by up to ~3 km so that GHCN and Meteostat points at one station stay visible
+  st_jitter(amount = 3000) |>
+  st_transform(4326) |>
+  mutate(
+    focus = wmo %in% focus_wmo,
+    station = names(focus_wmo)[match(wmo, focus_wmo)]
+  )
+```
+
+```{r}
+#| label: fig-stations-national
+#| fig-cap: "Stations within 400 km of the Makay boundary (GHCN-Daily and Meteostat), with Makay outlined. Points are jittered by up to about 3 km and drawn semi-transparent, so the two sources at one station remain visible. Positions are approximate."
+#| fig-height: 7
+# ggrepel has no sf layers, so labels are placed on plain X/Y coordinates
+sf_xy <- function(x) bind_cols(st_drop_geometry(x), as_tibble(st_coordinates(x)))
+
+station_labels_xy <- station_pts |>
+  arrange(desc(source)) |>
+  group_by(wmo) |>
+  slice(1) |>
+  ungroup() |>
+  sf_xy()
+
+ggplot() +
+  geom_sf(data = mdg_border, fill = "grey97", color = "grey40", linewidth = 0.3) +
+  geom_sf(data = alentours, fill = NA, color = "#2b6cb0", linetype = "dashed", linewidth = 0.5) +
+  geom_sf(data = makay, fill = "grey85", color = "grey30") +
+  geom_sf(data = station_pts, aes(color = source), alpha = 0.5, size = 2.5) +
+  geom_label_repel(
+    data = station_labels_xy, aes(X, Y, label = name),
+    size = 2.5, max.overlaps = Inf, min.segment.length = 0, label.padding = 0.15
+  ) +
+  coord_sf(xlim = c(42.5, 49.5), ylim = c(-26, -15.5), expand = FALSE) +
+  labs(color = "Source", x = NULL, y = NULL)
+```
+
+```{r}
+#| label: fig-stations-focus
+#| fig-cap: "The three stations closest to Makay, with the Makay boundary. GHCN-Daily and Meteostat points are jittered by up to about 3 km and drawn semi-transparent; their two symbols overlap at each station."
+#| fig-height: 5.5
+focus_pts <- station_pts |> filter(focus)
+
+ggplot() +
+  geom_sf(data = mdg_border, fill = "grey97", color = "grey40", linewidth = 0.3) +
+  geom_sf(data = alentours, fill = NA, color = "#2b6cb0", linetype = "dashed", linewidth = 0.5) +
+  geom_sf(data = makay, fill = "grey85", color = "grey30") +
+  geom_sf_text(data = makay_label, aes(label = NAME), size = 3) +
+  geom_sf(data = focus_pts, aes(color = source), alpha = 0.5, size = 3) +
+  geom_label_repel(
+    data = focus_pts |> distinct(station, .keep_all = TRUE) |> sf_xy(),
+    aes(X, Y, label = station), size = 3, min.segment.length = 0
+  ) +
+  coord_sf(xlim = c(42.9, 46), ylim = c(-23.3, -19.8), expand = FALSE) +
+  labs(color = "Source", x = NULL, y = NULL)
+```
+
+## Focus period: November 2019 to October 2020
+
+### Download of station records
+
+```{r}
+#| label: download-daily
+ghcn_daily <- station_meta |>
+  filter(source == "GHCN-Daily") |>
+  pull(station_id) |>
+  map(\(id) {
+    file <- fetch(
+      paste0("https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/", id, ".csv"),
+      file.path(raw_dir, paste0("ghcn_", id, ".csv"))
+    )
+    read_csv(file, col_select = c(STATION, DATE, PRCP), show_col_types = FALSE)
+  }) |>
+  list_rbind()
+
+ms_daily_cols <- c("date", "tavg", "tmin", "tmax", "prcp", "snow", "wdir", "wspd", "wpgt", "pres", "tsun")
+
+ms_daily <- station_meta |>
+  filter(source == "Meteostat") |>
+  pull(station_id) |>
+  map(\(id) {
+    file <- fetch(
+      paste0("https://bulk.meteostat.net/v2/daily/", id, ".csv.gz"),
+      file.path(raw_dir, paste0("meteostat_", id, ".csv.gz"))
+    )
+    read_csv(file,
+      col_names = ms_daily_cols,
+      col_types = cols(.default = col_double(), date = col_date()),
+      show_col_types = FALSE
+    ) |>
+      select(date, prcp) |>
+      mutate(station_id = id)
+  }) |>
+  list_rbind()
+
+station_labels <- station_meta |>
+  arrange(desc(source)) |>
+  distinct(wmo, .keep_all = TRUE) |>
+  transmute(wmo, label = paste0(name, " (", wmo, ")"))
+
+daily <- bind_rows(
+  ghcn_daily |>
+    transmute(
+      source = "GHCN-Daily",
+      station_id = str_sub(STATION, 1, 11),
+      date = DATE,
+      # GHCN-Daily stores PRCP in tenths of mm
+      prcp = PRCP / 10
+    ),
+  ms_daily |>
+    transmute(source = "Meteostat", station_id, date, prcp)
+) |>
+  inner_join(
+    station_meta |> select(source, station_id, wmo),
+    by = c("source", "station_id")
+  ) |>
+  left_join(station_labels, by = "wmo") |>
+  rename(name = label)
+```
+
+The GHCN per-station files use the full 11-character ID, which is what `station_id` holds, so the join to the metadata uses the same key. Meteostat IDs are the 5-digit WMO numbers, which match the last five characters of the GHCN IDs. The `wmo` column links the two sources for the same physical station.
+
+### Observation counts in the window
+
+The window is the hydrological year 2019/20. Observed days per month are counted from the daily records, by source. A month's total is only a usable comparison when most of its days are observed; here no month reaches 80% at any of the three stations.
+
+```{r}
+#| label: focus-monthly
+focus_monthly <- expand_grid(
+  source = c("GHCN-Daily", "Meteostat"),
+  station = factor(names(focus_wmo), levels = names(focus_wmo)),
+  month = focus_months
+) |>
+  left_join(
+    daily |>
+      filter(wmo %in% focus_wmo, date >= min(focus_months), date < focus_end) |>
+      mutate(
+        station = factor(names(focus_wmo)[match(wmo, focus_wmo)], levels = names(focus_wmo)),
+        month = floor_date(date, "month")
+      ) |>
+      group_by(source, station, month) |>
+      summarise(
+        days_obs = sum(!is.na(prcp)),
+        obs_sum_mm = sum(prcp, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = c("source", "station", "month")
+  ) |>
+  mutate(
+    days_obs = replace_na(days_obs, 0L),
+    obs_sum_mm = if_else(days_obs == 0, NA_real_, obs_sum_mm)
+  )
+
+focus_monthly |>
+  mutate(month_lab = mlab(month)) |>
+  select(station, source, month_lab, days_obs) |>
+  pivot_wider(names_from = month_lab, values_from = days_obs) |>
+  kable(caption = "Days with a non-missing PRCP value per month, November 2019 to October 2020, by station and source. Out of about 30 days per month, no month is near complete at any station.")
+```
+
+Morombe has no observed day in either source during the window, although its GHCN-Daily record runs from 1973 to February 2022. Ranohira's GHCN-Daily record ends on 15 November 2020 and Morondava's on 29 December 2020, so the window is the last year of those records in GHCN-Daily.
+
+On days observed by both sources in the window, the GHCN-Daily and Meteostat values are identical to within 0.1 mm on the share of days shown below. Meteostat therefore carries the same observations here, and it does not give an independent check on the station values.
+
+```{r}
+#| label: window-agreement
+window_agree <- daily |>
+  filter(wmo %in% focus_wmo, date >= min(focus_months), date < focus_end) |>
+  select(wmo, date, source, prcp) |>
+  pivot_wider(names_from = source, values_from = prcp) |>
+  filter(!is.na(`GHCN-Daily`), !is.na(Meteostat)) |>
+  mutate(station = names(focus_wmo)[match(wmo, focus_wmo)])
+
+window_agree |>
+  group_by(station) |>
+  summarise(
+    days_paired = n(),
+    share_within_0.1mm = round(mean(abs(`GHCN-Daily` - Meteostat) < 0.1), 3),
+    .groups = "drop"
+  ) |>
+  arrange(match(station, names(focus_wmo))) |>
+  kable(caption = "Days observed in both GHCN-Daily and Meteostat, November 2019 to October 2020, and the share on which the two values agree within 0.1 mm.")
+```
+
+### WorldClim monthly values
+
+WorldClim's historical monthly precipitation is interpolated from station data (CRU TS 4.09), at 5 arc-minute resolution (about 9 km). It is not a station record, so it is used here only as a cross-check. The 1970-2000 normals come from the same product family at 30 arc-second resolution.
+
+```{r}
+#| label: worldclim-data
+wc_url <- "https://geodata.ucdavis.edu/climate/worldclim/2_1/hist/cts4.09/"
+wc_zips <- c(
+  "wc2.1_cruts4.09_5m_prec_2010-2019.zip",
+  "wc2.1_cruts4.09_5m_prec_2020-2024.zip"
+)
+wc_dir <- file.path(raw_dir, "worldclim")
+wc_month_dir <- file.path(wc_dir, "monthly")
+dir.create(wc_month_dir, recursive = TRUE, showWarnings = FALSE)
+
+walk(wc_zips, \(z) fetch(paste0(wc_url, z), file.path(wc_dir, z)))
+
+wc_tifs <- sprintf("wc2.1_cruts4.09_5m_prec_%s.tif", format(focus_months, "%Y-%m"))
+walk2(wc_tifs, if_else(year(focus_months) == 2019, wc_zips[1], wc_zips[2]), \(tif, z) {
+  if (!file.exists(file.path(wc_month_dir, tif))) {
+    unzip(file.path(wc_dir, z), files = tif, exdir = wc_month_dir)
+  }
+})
+
+wc_month <- rast(file.path(wc_month_dir, wc_tifs)) |>
+  crop(ext(40, 52, -26, -11))
+names(wc_month) <- format(focus_months, "%Y-%m")
+
+nrm <- worldclim_country("Madagascar", var = "prec", path = wc_dir)
+
+focus_pts_v <- station_meta |>
+  filter(wmo %in% focus_wmo) |>
+  arrange(source) |>
+  distinct(wmo, .keep_all = TRUE) |>
+  transmute(station = names(focus_wmo)[match(wmo, focus_wmo)], lon, lat) |>
+  arrange(match(station, names(focus_wmo)))
+
+focus_vect <- vect(focus_pts_v, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+wc_station <- as_tibble(terra::extract(wc_month, focus_vect)) |>
+  mutate(station = focus_pts_v$station[ID]) |>
+  select(-ID) |>
+  pivot_longer(-station, names_to = "month", values_to = "wc_2019_20_mm") |>
+  mutate(month = ym(month))
+
+normal_station <- as_tibble(terra::extract(nrm, focus_vect)) |>
+  mutate(station = focus_pts_v$station[ID]) |>
+  select(-ID) |>
+  pivot_longer(-station, names_to = "layer", values_to = "wc_normal_mm") |>
+  mutate(m = as.integer(str_extract(layer, "\\d+$"))) |>
+  select(station, m, wc_normal_mm)
+
+wc_focus <- wc_station |>
+  mutate(m = month(month)) |>
+  left_join(normal_station, by = c("station", "m")) |>
+  select(station, month, wc_2019_20_mm, wc_normal_mm)
+```
+
+```{r}
+#| label: tbl-wc-check
+#| tbl-cap: "Observed monthly sums (GHCN-Daily, observed days only) against WorldClim for the same station and month. A sum over fewer than all days is a lower bound on the monthly total, so an observed sum above the WorldClim value points to a disagreement. Months with no observed day are omitted."
+wc_check <- focus_monthly |>
+  filter(source == "GHCN-Daily", days_obs > 0) |>
+  left_join(wc_focus, by = c("station", "month")) |>
+  mutate(`Observed sum above WorldClim` = if_else(obs_sum_mm > wc_2019_20_mm, "Yes", "No"))
+
+wc_check |>
+  transmute(
+    Station = station,
+    Month = mlab(month),
+    `Days observed` = days_obs,
+    `Observed sum (mm, lower bound)` = round(obs_sum_mm, 1),
+    `WorldClim 2019/20 (mm)` = round(wc_2019_20_mm, 1),
+    `WorldClim 1970-2000 (mm)` = round(wc_normal_mm, 1),
+    `Observed sum above WorldClim` = `Observed sum above WorldClim`
+  ) |>
+  kable()
+```
+
+```{r}
+#| label: fig-focus-monthly
+#| fig-cap: "Monthly precipitation at the three closest stations, November 2019 to October 2020. Points are the sum of observed days only (lower bounds on the monthly total); lines are WorldClim for the same months and the WorldClim 1970-2000 normal. Morombe has no observed day in the window, so only its WorldClim lines are shown."
+#| fig-height: 7
+wc_long <- wc_focus |>
+  pivot_longer(
+    c(wc_2019_20_mm, wc_normal_mm),
+    names_to = "series",
+    values_to = "mm"
+  ) |>
+  mutate(series = if_else(series == "wc_2019_20_mm", "WorldClim 2019/20", "WorldClim 1970-2000 normal"))
+
+focus_monthly |>
+  filter(!is.na(obs_sum_mm)) |>
+  ggplot() +
+  geom_line(data = wc_long, aes(month, mm, linetype = series)) +
+  # Dodged so that the two sources at one station remain visible
+  geom_point(aes(month, obs_sum_mm, color = source),
+    alpha = 0.6, size = 2.5, position = position_dodge(width = 12)
+  ) +
+  facet_wrap(~station, ncol = 1) +
+  scale_x_date(breaks = focus_months, labels = \(x) mlab(x) |> str_replace(" 20(\\d\\d)$", " \\1")) +
+  labs(x = NULL, y = "Precipitation (mm)", color = "Station record", linetype = "WorldClim")
+```
+
+```{r}
+#| label: fig-worldclim-map
+#| fig-cap: "WorldClim total precipitation, November 2019 to October 2020 (5 arc-minute, CRU based), with the Makay boundary and the three closest stations."
+#| fig-height: 5.5
+wc_total <- app(wc_month, sum) |>
+  crop(ext(42.9, 46, -23.3, -19.8))
+
+wc_total_df <- as.data.frame(wc_total, xy = TRUE) |>
+  select(x, y, mm = last_col())
+
+ggplot() +
+  geom_raster(data = wc_total_df, aes(x, y, fill = mm)) +
+  geom_sf(data = mdg_border, fill = NA, color = "grey30", linewidth = 0.3) +
+  geom_sf(data = alentours, fill = NA, color = "#2b6cb0", linetype = "dashed", linewidth = 0.5) +
+  geom_sf(data = makay, fill = NA, color = "black", linewidth = 0.6) +
+  geom_sf(data = focus_pts_v |> st_as_sf(coords = c("lon", "lat"), crs = 4326), shape = 21, fill = "white", size = 3) +
+  geom_label_repel(
+    data = focus_pts_v |> st_as_sf(coords = c("lon", "lat"), crs = 4326) |> sf_xy(),
+    aes(X, Y, label = station), size = 3, min.segment.length = 0
+  ) +
+  coord_sf(xlim = c(42.9, 46), ylim = c(-23.3, -19.8), expand = FALSE) +
+  scale_fill_viridis_c(name = "mm", option = "mako") +
+  labs(x = NULL, y = NULL)
+```
+
+### Makay area against WorldClim
+
+WorldClim is the only gridded product used here for the Makay boundary, and no station lies inside it. The table gives the monthly area mean over the Makay polygon, for the same months and for the 1970-2000 normal.
+
+```{r}
+#| label: tbl-makay-wc
+#| tbl-cap: "WorldClim monthly precipitation averaged over the Makay polygon, November 2019 to October 2020, against the 1970-2000 normal. Totals are the sum of the twelve months."
+makay_v <- vect(makay)
+
+makay_wc <- tibble(
+  Month = focus_months,
+  `WorldClim 2019/20 (mm)` = as.numeric(terra::extract(wc_month, makay_v, fun = mean, na.rm = TRUE, exact = TRUE)[1, -1]),
+  normal_all = as.numeric(terra::extract(nrm, makay_v, fun = mean, na.rm = TRUE, exact = TRUE)[1, -1])
+) |>
+  mutate(`WorldClim 1970-2000 normal (mm)` = normal_all[month(Month)]) |>
+  select(-normal_all)
+
+makay_wc |>
+  mutate(
+    Month = mlab(Month),
+    `Difference (%)` = round(100 * (`WorldClim 2019/20 (mm)` - `WorldClim 1970-2000 normal (mm)`) / `WorldClim 1970-2000 normal (mm)`),
+    across(where(is.numeric) & !contains("%"), \(x) round(x, 1))
+  ) |>
+  bind_rows(
+    makay_wc |>
+      summarise(
+        Month = "Total",
+        `WorldClim 2019/20 (mm)` = round(sum(`WorldClim 2019/20 (mm)`), 1),
+        `WorldClim 1970-2000 normal (mm)` = round(sum(`WorldClim 1970-2000 normal (mm)`), 1)
+      ) |>
+      mutate(`Difference (%)` = round(100 * (`WorldClim 2019/20 (mm)` - `WorldClim 1970-2000 normal (mm)`) / `WorldClim 1970-2000 normal (mm)`))
+  ) |>
+  kable()
+```
+
+### CHIRPS gridded comparison
+
+CHIRPS is a gauge-satellite blend, so it is not an independent observation, but it covers the window fully and can be averaged over the Makay polygon, which no station can. The version used here is CHIRPS v2.0 monthly precipitation on a 0.05 degree grid. The twelve monthly GeoTIFFs for November 2019 to October 2020 were taken from a local S3 copy of the CHC product archive (`s3://projet-betsaka/PA-impact-deforestation/mapme/chirps/`), since the original CHC paths and the ERDDAP mirror used by `climateR` did not answer during testing.
+
+```{r}
+#| label: chirps-download
+chirps_dir <- file.path(raw_dir, "chirps")
+chirps_ym <- format(focus_months, "%Y.%m")
+chirps_fetch <- function(ym) {
+  file <- file.path(chirps_dir, sprintf("chirps-v2.0.%s.tif", ym))
+  if (!file.exists(file)) {
+    s3 <- paws.storage::s3()
+    o <- s3$get_object(
+      Bucket = "projet-betsaka",
+      Key = paste0("PA-impact-deforestation/mapme/chirps/chirps-v2.0.", ym, ".tif")
+    )
+    writeBin(o$Body, file)
+  }
+  file
+}
+chirps_files <- map(chirps_ym, chirps_fetch)
+chirps_stack <- rast(unlist(chirps_files))
+names(chirps_stack) <- format(focus_months, "%Y-%m")
+```
+
+The Makay polygon mean uses cell areas as weights, since the polygon spans several cells. Station values are bilinear samples at the GHCN coordinates.
+
+```{r}
+#| label: tbl-chirps-makay
+#| tbl-cap: "CHIRPS monthly precipitation averaged over the Makay polygon, November 2019 to October 2020, against WorldClim for the same window. Totals are the sum of the twelve months."
+e_makay <- terra::extract(chirps_stack, makay, weights = TRUE, exact = FALSE)
+wts <- e_makay$weight
+makay_chirps <- sapply(names(chirps_stack), \(n) weighted.mean(e_makay[[n]], wts))
+
+makay_chirps_tbl <- tibble(
+  Month = focus_months,
+  `CHIRPS (mm)` = makay_chirps,
+  `WorldClim 2019/20 (mm)` = makay_wc$`WorldClim 2019/20 (mm)`
+) |>
+  mutate(
+    Month = mlab(Month),
+    across(where(is.numeric) & !contains("%"), \(x) round(x, 1))
+  ) |>
+  bind_rows(
+    tibble(
+      Month = "Total",
+      `CHIRPS (mm)` = round(sum(makay_chirps), 1),
+      `WorldClim 2019/20 (mm)` = round(sum(makay_wc$`WorldClim 2019/20 (mm)`), 1)
+    )
+  )
+
+makay_chirps_tbl |> kable()
+```
+
+```{r}
+#| label: fig-chirps-stations
+#| fig-cap: "CHIRPS monthly precipitation sampled at the station coordinates, against the observed GHCN-Daily sums, November 2019 to October 2020. Observed sums are lower bounds because no month is complete."
+chirps_pts_meta <- station_meta |>
+  filter(source == "GHCN-Daily", wmo %in% focus_wmo) |>
+  distinct(wmo, .keep_all = TRUE)
+chirps_pts_sf <- st_as_sf(chirps_pts_meta, coords = c("lon", "lat"), crs = 4326)
+chirps_pts_tbl <- terra::extract(chirps_stack, chirps_pts_sf, method = "bilinear") |>
+  as.data.frame() |>
+  as_tibble() |>
+  mutate(wmo = chirps_pts_meta$wmo[as.integer(ID)]) |>
+  pivot_longer(-c(ID, wmo), names_to = "month", values_to = "CHIRPS (mm)") |>
+  mutate(month = as.Date(paste0(month, "-01")))
+
+chirps_cmp <- daily |>
+  filter(source == "GHCN-Daily", wmo %in% focus_wmo, date >= min(focus_months), date < focus_end) |>
+  mutate(month = floor_date(date, "month")) |>
+  summarise(
+    `Observed (mm)` = sum(prcp, na.rm = TRUE),
+    ndays = sum(!is.na(prcp)),
+    .by = c(wmo, month)
+  ) |>
+  left_join(chirps_pts_tbl, by = c("wmo", "month" = "month")) |>
+  left_join(distinct(station_meta, wmo, name), by = "wmo")
+
+chirps_cmp |>
+  filter(ndays > 0) |>
+  select(name, month, `Observed (mm)`, `CHIRPS (mm)`, ndays) |>
+  pivot_longer(c(`Observed (mm)`, `CHIRPS (mm)`), names_to = "Source", values_to = "mm") |>
+  ggplot(aes(month, mm, fill = Source)) +
+  geom_col(position = position_dodge()) +
+  facet_wrap(~name, ncol = 1) +
+  scale_x_date(breaks = focus_months, labels = \(x) mlab(x)) +
+  labs(x = NULL, y = "Monthly rainfall (mm)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+chirps_corr <- cor(chirps_cmp$`CHIRPS (mm)`, chirps_cmp$`Observed (mm)`)
+chirps_bias <- mean(chirps_cmp$`CHIRPS (mm)` - chirps_cmp$`Observed (mm)`)
+chirps_total <- sum(makay_chirps)
+wc_total <- sum(makay_wc$`WorldClim 2019/20 (mm)`)
+chirps_wc_gap <- 100 * (chirps_total - wc_total) / wc_total
+chirps_maxdiff <- max(abs(makay_chirps - makay_wc$`WorldClim 2019/20 (mm)`))
+```
+
+Over the 17 station-months with observations, the CHIRPS sample correlates with the observed sums at r = `r round(chirps_corr, 2)` (Pearson), and CHIRPS is higher on average by about `r round(chirps_bias)` mm per month. The direction of that gap is expected, since the observed sums omit unobserved days, but the gap is not uniform: it is small at Ranohira throughout the wet season and largest at Morondava in January 2020, where the observed sum already exceeds CHIRPS. As with WorldClim, the data cannot separate station error from grid error.
+
+Over the Makay polygon, CHIRPS gives a window total of `r round(chirps_total)` mm against the WorldClim 2019/20 total of `r round(wc_total)` mm, about `r round(chirps_wc_gap)`% lower. The two products agree on the shape of the season (peaks in December to February, near-zero June to September) but differ by up to about `r round(chirps_maxdiff)` mm in individual months, most visibly in January 2020.
+
+## Coverage over 1991-2020
+
+Coverage is measured as the share of calendar days with a non-missing precipitation value. Years are counted as complete at 90% of days observed; months at 80%. These thresholds are working choices. Station names differ between sources for WMO 67085 (GHCN: Antananarivo/Ville; Meteostat: Ambohimanarina), so each station is labelled from its Meteostat name where one exists.
+
+```{r}
+#| label: tbl-coverage
+#| tbl-cap: "Share of days observed in 1991-2020 by station and source, with the first and last observed day."
+coverage <- daily |>
+  group_by(source, name, wmo) |>
+  summarise(
+    first_obs = min(date[!is.na(prcp)]),
+    last_obs = max(date[!is.na(prcp)]),
+    pct_obs_1991_2020 = round(100 * sum(!is.na(prcp) & year(date) %in% clim_years) / n_clim_days, 1),
+    .groups = "drop"
+  ) |>
+  arrange(desc(pct_obs_1991_2020))
+
+coverage |> kable()
+```
+
+```{r}
+#| label: fig-year-coverage
+#| fig-cap: "Share of days observed in each calendar year, by station and source."
+#| fig-height: 6
+annual <- daily |>
+  mutate(year = year(date)) |>
+  group_by(source, name, wmo, year) |>
+  summarise(
+    n_obs = sum(!is.na(prcp)),
+    total_mm = sum(prcp, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    days_in_year = if_else(leap_year(year), 366, 365),
+    complete = n_obs >= 0.9 * days_in_year,
+    total_complete = if_else(complete, total_mm, NA_real_)
+  )
+
+year_coverage <- annual |>
+  mutate(pct_obs = 100 * n_obs / days_in_year)
+
+year_coverage |>
+  ggplot(aes(year, name, fill = pct_obs)) +
+  geom_tile() +
+  facet_wrap(~source, ncol = 1, scales = "free_y") +
+  labs(x = NULL, y = NULL, fill = "% days observed")
+```
+
+```{r}
+#| label: tbl-year-thresholds
+#| tbl-cap: "Number of years in 1991-2020 meeting each completeness threshold (out of 30)."
+annual |>
+  filter(year %in% clim_years) |>
+  group_by(source, name) |>
+  summarise(
+    years_ge50 = sum(n_obs >= 0.5 * days_in_year),
+    years_ge80 = sum(n_obs >= 0.8 * days_in_year),
+    years_ge90 = sum(complete),
+    .groups = "drop"
+  ) |>
+  arrange(source, desc(years_ge80)) |>
+  kable(col.names = c("Source", "Station", "Years >=50% obs", "Years >=80% obs", "Years >=90% obs"))
+```
+
+Annual totals are not reported as normals: no station has a year with at least 90% of days observed in 1991-2020, and few years meet 80%. Annual sums from years below that level would be biased low.
+
+```{r}
+#| label: monthly-clim
+monthly <- daily |>
+  mutate(year = year(date), month = month(date)) |>
+  group_by(source, name, wmo, year, month) |>
+  summarise(
+    n_obs = sum(!is.na(prcp)),
+    total_mm = sum(prcp, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    days = days_in_month(ymd(paste(year, month, 1))),
+    complete = n_obs >= 0.8 * days,
+    total_complete = if_else(complete, total_mm, NA_real_)
+  )
+
+clim_month <- monthly |>
+  filter(year %in% clim_years) |>
+  group_by(source, name, month) |>
+  summarise(
+    mean_mm = mean(total_complete, na.rm = TRUE),
+    n_years = sum(complete),
+    .groups = "drop"
+  ) |>
+  filter(n_years >= 5)
+```
+
+```{r}
+#| label: fig-monthly-clim
+#| fig-cap: "Mean monthly precipitation, 1991-2020, from months with at least 80% of days observed. A month is shown only if at least 5 years are complete for it, so the means rest on few years and are indicative only."
+#| fig-height: 7
+clim_month |>
+  ggplot(aes(month, mean_mm, color = source)) +
+  geom_line() +
+  facet_wrap(~name, ncol = 2) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  labs(x = NULL, y = "Mean monthly precipitation, 1991-2020 (mm)", color = "Source")
+```
+
+## Agreement between GHCN-Daily and Meteostat over the full record
+
+Twelve stations appear in both sources. On paired days, the values agree almost exactly (see table), so for these stations Meteostat carries the same observations as GHCN-Daily rather than an independent record. Meteostat's series runs to March 2026 at every station, beyond GHCN-Daily's end date; that extension is not covered by this check and its provenance was not verified.
+
+```{r}
+#| label: tbl-agreement
+#| tbl-cap: "Agreement between GHCN-Daily and Meteostat on all days observed by both sources, for each station."
+paired <- daily |>
+  filter(source == "GHCN-Daily") |>
+  select(name, wmo, date, ghcn = prcp) |>
+  inner_join(
+    daily |>
+      filter(source == "Meteostat") |>
+      select(wmo, date, ms = prcp),
+    by = c("wmo", "date")
+  ) |>
+  filter(!is.na(ghcn), !is.na(ms))
+
+paired |>
+  group_by(name) |>
+  summarise(
+    days_paired = n(),
+    share_within_0.1mm = round(mean(abs(ghcn - ms) < 0.1), 3),
+    daily_correlation = round(cor(ghcn, ms), 3),
+    mean_diff_mm = round(mean(ms - ghcn), 2),
+    .groups = "drop"
+  ) |>
+  kable()
+```
+
+## Summary of the nearest stations
+
+```{r}
+#| label: tbl-summary
+#| tbl-cap: "Nearest stations with their distance, record end and coverage over 1991-2020."
+station_meta |>
+  transmute(source, name, wmo, dist_km = round(dist_km), elev) |>
+  left_join(coverage |> select(source, wmo, first_obs, last_obs, pct_obs_1991_2020), by = c("source", "wmo")) |>
+  left_join(
+    annual |>
+      filter(year %in% clim_years) |>
+      group_by(source, wmo) |>
+      summarise(years_ge80 = sum(n_obs >= 0.8 * days_in_year), .groups = "drop"),
+    by = c("source", "wmo")
+  ) |>
+  arrange(dist_km) |>
+  kable(col.names = c("Source", "Station", "WMO", "Distance (km)", "Elevation (m)", "First obs", "Last obs", "% days obs 1991-2020", "Years >=80% obs 1991-2020"))
+```
+
+## Assessment
+
+### NOAA GHCN-Daily
+
+Open access, no key or registration, plain CSV per station. The station list, inventory and per-station files all answered in testing. Twelve Malagasy stations with PRCP records lie within 400 km of the Makay boundary. The records are gauge observations, not modelled values. The per-station files store PRCP in tenths of mm, which is converted above. In the focus window, Ranohira has observed days in 11 of the 12 months and Morondava in 6, and neither has a complete month; Morombe has none. Ranohira's record ends on 15 November 2020 and Morondava's on 29 December 2020.
+
+### Meteostat
+
+The bulk daily files (`bulk.meteostat.net`) and station index download without a key, which is what this document uses; the API was not tested. In the focus window, the Meteostat values are identical to GHCN-Daily on every day both sources observe, so Meteostat adds convenience and a longer recent series rather than a separate network. The station index lists some Malagasy stations with inventory end dates in 2027, which is after the date of this analysis, and the observed series end in March 2026, so the index dates are not reliable and were not used. Confirm the licence and attribution terms on meteostat.net before redistributing.
+
+### Meteo Madagascar (IRI Data Library)
+
+The site is reachable (HTTP 200 on the home page and the monthly rainfall branch) and states that data can be downloaded free of charge, including in GIS-compatible formats. The monthly rainfall branch (`.Madagascar_v3/.ALL/.monthly/.rainfall/`) holds one dataset, `.rfe`. Its metadata describes a gridded product on a 0.0375 degree grid, covering January 1981 to August 2020, in mm. It is therefore a gridded estimate rather than station records, and it is excluded from the station comparison. It also stops before September 2020, so it cannot cover the full window. Whether its source is satellite, gauge-based or a blend was not established. The daily and dekadal branches were not inspected, so whether Meteo Madagascar holds station-level records is not established.
+
+### WorldClim
+
+The historical monthly product covers every month of the window at 5 arc-minute resolution. It is interpolated and gridded, so it is not an observation, and each station value is one grid cell. Because the observed sums are partial, most station-months fall below WorldClim (12 of 17 with observations), which is expected from missing days. In the other 5, the observed sum already exceeds WorldClim (see the check table). Those cases point to WorldClim being too low for the cell, to an error in the station values, or to both, and the data here cannot separate these.
+
+### CHIRPS
+
+CHIRPS v2.0 monthly (0.05 degree) covers the full window and answers without a key, in this case through a local S3 copy of the CHC archive; the CHC paths and the ERDDAP mirror used by `climateR` did not answer during testing. It is a gauge-satellite blend, so it does not validate the station records independently, but it is the only gridded product here that covers the window month by month. Sampled at the stations it tracks the observed month-to-month variation closely (r = 0.94 over 17 station-months), and over the Makay polygon it gives a window total about 16% below WorldClim. Confirm the CHIRPS licence and preferred citation (Funk et al. 2015) before redistribution.
+
+## Limitations
+
+- No station lies inside or adjacent to the Makay boundary. The nearest records (Ranohira, Morondava) are about 85 km and 115 km away, and their 1991-2020 observed coverage is 15% and 20% of days.
+- In the focus window, no month at any of the three stations is complete enough to give a station monthly total. The observed sums in the comparison are lower bounds, so the check can show where WorldClim is too low, but not where it is too high.
+- Morombe has no observed day in the window, so there is no station evidence for the coastal stretch around Morombe during the focus period.
+- Makay is listed as "Proposed" in WDPA Nov 2026, so the boundary may still change.
+- Beroroha has no record in GHCN-Daily or Meteostat. A station record for it would need Meteo Madagascar's station network or Malagasy meteorological records.
+- Completeness thresholds (80% for months, 90% for years) are working choices.
+- No statistical testing is performed here; the aim is to describe availability and coverage.
+
+<SUGGESTION>Check Meteo Madagascar's daily and dekadal branches for station-level rainfall records near Beroroha and Makay.</SUGGESTION>

@@ -1,6 +1,6 @@
 ---
 title: "Rainfall data for the Makay protected area, Madagascar"
-subtitle: "Source accessibility, station coverage and the November 2019 to October 2020 window"
+subtitle: "Source accessibility, station coverage and gridded rainfall over the Makay, November 2019 to October 2020"
 date: today
 format:
   html:
@@ -16,16 +16,17 @@ execute:
 
 ## Purpose
 
-This document assesses three sources of rainfall data for southwestern Madagascar and looks at the observed station records closest to the Makay protected area. The main focus is the period November 2019 to October 2020. For that period the station records are compared across sources and cross-checked against WorldClim. Gridded or modelled products are reported but do not enter the station analysis.
+This document assesses rainfall data sources for the Makay protected area in southwestern Madagascar. The station records within 400 km are assessed for accessibility and completeness. Because no station lies inside the Makay boundary and no station has a complete month in the focus window (November 2019 to October 2020), rainfall over the massif itself is estimated from gridded products compared over the Makay polygon: ENACTS v4 daily, CHIRPS v2.0 monthly and WorldClim historical monthly.
 
 Sources assessed:
 
 - NOAA Global Historical Climatology Network-Daily (GHCN-Daily)
 - Meteostat
-- Meteo Madagascar climate data library (IRI Data Library, map.meteomadagascar.mg)
+- ENACTS v4 daily rainfall (Meteo Madagascar maproom, IRI Data Library, map.meteomadagascar.mg), supplied as `data.nc`
 
-Cross-check:
+Cross-checks:
 
+- CHIRPS v2.0 monthly precipitation (gauge-satellite blend, 0.05 degree)
 - WorldClim 2.1 historical monthly precipitation (CRU TS 4.09 based, 5 arc-minute) and the 1970-2000 normals (30 arc-second)
 
 ## Study area
@@ -304,25 +305,6 @@ ggplot() +
   labs(color = "Source", x = NULL, y = NULL)
 ```
 
-```{r}
-#| label: fig-stations-focus
-#| fig-cap: "The three stations closest to Makay, with the Makay boundary. GHCN-Daily and Meteostat points are jittered by up to about 3 km and drawn semi-transparent; their two symbols overlap at each station."
-#| fig-height: 5.5
-focus_pts <- station_pts |> filter(focus)
-
-ggplot() +
-  geom_sf(data = mdg_border, fill = "grey97", color = "grey40", linewidth = 0.3) +
-  geom_sf(data = alentours, fill = NA, color = "#2b6cb0", linetype = "dashed", linewidth = 0.5) +
-  geom_sf(data = makay, fill = "grey85", color = "grey30") +
-  geom_sf_text(data = makay_label, aes(label = NAME), size = 3) +
-  geom_sf(data = focus_pts, aes(color = source), alpha = 0.5, size = 3) +
-  geom_label_repel(
-    data = focus_pts |> distinct(station, .keep_all = TRUE) |> sf_xy(),
-    aes(X, Y, label = station), size = 3, min.segment.length = 0
-  ) +
-  coord_sf(xlim = c(42.9, 46), ylim = c(-23.3, -19.8), expand = FALSE) +
-  labs(color = "Source", x = NULL, y = NULL)
-```
 
 ## Focus period: November 2019 to October 2020
 
@@ -429,27 +411,6 @@ focus_monthly |>
 
 Morombe has no observed day in either source during the window, although its GHCN-Daily record runs from 1973 to February 2022. Ranohira's GHCN-Daily record ends on 15 November 2020 and Morondava's on 29 December 2020, so the window is the last year of those records in GHCN-Daily.
 
-On days observed by both sources in the window, the GHCN-Daily and Meteostat values are identical to within 0.1 mm on the share of days shown below. Meteostat therefore carries the same observations here, and it does not give an independent check on the station values.
-
-```{r}
-#| label: window-agreement
-window_agree <- daily |>
-  filter(wmo %in% focus_wmo, date >= min(focus_months), date < focus_end) |>
-  select(wmo, date, source, prcp) |>
-  pivot_wider(names_from = source, values_from = prcp) |>
-  filter(!is.na(`GHCN-Daily`), !is.na(Meteostat)) |>
-  mutate(station = names(focus_wmo)[match(wmo, focus_wmo)])
-
-window_agree |>
-  group_by(station) |>
-  summarise(
-    days_paired = n(),
-    share_within_0.1mm = round(mean(abs(`GHCN-Daily` - Meteostat) < 0.1), 3),
-    .groups = "drop"
-  ) |>
-  arrange(match(station, names(focus_wmo))) |>
-  kable(caption = "Days observed in both GHCN-Daily and Meteostat, November 2019 to October 2020, and the share on which the two values agree within 0.1 mm.")
-```
 
 ### WorldClim monthly values
 
@@ -555,69 +516,78 @@ focus_monthly |>
   labs(x = NULL, y = "Precipitation (mm)", color = "Station record", linetype = "WorldClim")
 ```
 
-```{r}
-#| label: fig-worldclim-map
-#| fig-cap: "WorldClim total precipitation, November 2019 to October 2020 (5 arc-minute, CRU based), with the Makay boundary and the three closest stations."
-#| fig-height: 5.5
-wc_total <- app(wc_month, sum) |>
-  crop(ext(42.9, 46, -23.3, -19.8))
+## Gridded rainfall over the Makay
 
-wc_total_df <- as.data.frame(wc_total, xy = TRUE) |>
-  select(x, y, mm = last_col())
+No station lies inside or adjacent to the Makay boundary, so the polygon mean of gridded products is the only estimate of rainfall over the massif itself. Three products are compared over the same polygon and the same window: ENACTS v4 daily, CHIRPS v2.0 monthly and WorldClim historical monthly, with the WorldClim 1970-2000 normal for reference. Polygon means use cell-overlap weights.
+
+### ENACTS v4
+
+ENACTS (Enhanced National Climate Services) products are built by national meteorological services with the IRI Data Library; for Madagascar they are served through the Meteo Madagascar maproom (map.meteomadagascar.mg). The file `data.nc` at the repository root is the daily rainfall layer (variable `rfe`, unit mm) of Madagascar ENACTS v4, downloaded from the maproom for this analysis. It covers 44.49-45.81 degrees east and 20.27-22.22 degrees south at 0.0375 degrees (about 4 km), with 366 daily layers from 1 November 2019 to 31 October 2020 on a julian-day time axis. ENACTS grids are produced by blending national station observations with satellite rainfall estimates; the exact v4 station network and satellite source are not stated in the file metadata, and the IRI Data Library catalog now requires sign-in, so they could not be verified here. Over the Makay box, no day and no cell is missing in the window.
+
+```{r}
+#| label: enacts-data
+enacts_file <- "data.nc"
+stopifnot(file.exists(enacts_file))
+enacts <- rast(enacts_file)
+
+# IRI julian-day time axis: JD 2440588 is 1970-01-01
+enacts_dates <- metags(enacts) |>
+  filter(name == "NETCDF_DIM_T_VALUES") |>
+  pull(value) |>
+  str_remove_all("[{}]") |>
+  str_split_1(",") |>
+  as.numeric() |>
+  (\(jd) as.Date(jd - 2440588, origin = "1970-01-01"))()
+stopifnot(length(enacts_dates) == nlyr(enacts), all(diff(enacts_dates) == 1))
+names(enacts) <- format(enacts_dates, "%Y-%m-%d")
+```
+
+```{r}
+#| label: enacts-makay-daily
+# Daily mean over the Makay polygon, weighted by each cell's overlap with the polygon
+# (extract returns the weights in a trailing column named "weight")
+enacts_ex <- terra::extract(enacts, makay, weights = TRUE, exact = FALSE)
+enacts_layers <- as.matrix(enacts_ex[setdiff(names(enacts_ex), c("ID", "weight"))])
+enacts_daily <- tibble(
+  date = enacts_dates,
+  prcp_mm = apply(enacts_layers, 2, \(v) weighted.mean(v, enacts_ex$weight, na.rm = TRUE))
+)
+
+dir.create("data/derived", showWarnings = FALSE)
+write_csv(enacts_daily, "data/derived/makay_enacts_daily.csv")
+
+enacts_monthly <- enacts_daily |>
+  mutate(month = floor_date(date, "month")) |>
+  summarise(mm = sum(prcp_mm), .by = month)
+```
+
+The daily series is exported to `data/derived/makay_enacts_daily.csv`, one row per day with columns `date` and `prcp_mm` (mm per day, area-weighted polygon mean).
+
+```{r}
+#| label: fig-enacts-map
+#| fig-cap: "ENACTS v4 total rainfall, November 2019 to October 2020, at 0.0375 degrees (about 4 km), with the Makay boundary and the Alentours outline. The product covers the downloaded box only."
+#| fig-height: 5.5
+enacts_total <- app(enacts, sum) |>
+  crop(ext(42.9, 46, -23.3, -19.8))
+enacts_map_df <- as.data.frame(enacts_total, xy = TRUE) |>
+  set_names(c("x", "y", "mm"))
 
 ggplot() +
-  geom_raster(data = wc_total_df, aes(x, y, fill = mm)) +
+  geom_raster(data = enacts_map_df, aes(x, y, fill = mm)) +
   geom_sf(data = mdg_border, fill = NA, color = "grey30", linewidth = 0.3) +
   geom_sf(data = alentours, fill = NA, color = "#2b6cb0", linetype = "dashed", linewidth = 0.5) +
   geom_sf(data = makay, fill = NA, color = "black", linewidth = 0.6) +
-  geom_sf(data = focus_pts_v |> st_as_sf(coords = c("lon", "lat"), crs = 4326), shape = 21, fill = "white", size = 3) +
-  geom_label_repel(
-    data = focus_pts_v |> st_as_sf(coords = c("lon", "lat"), crs = 4326) |> sf_xy(),
-    aes(X, Y, label = station), size = 3, min.segment.length = 0
-  ) +
-  coord_sf(xlim = c(42.9, 46), ylim = c(-23.3, -19.8), expand = FALSE) +
+  geom_sf_text(data = makay_label, aes(label = NAME), size = 3) +
+  coord_sf(xlim = c(44.35, 45.95), ylim = c(-22.4, -20.1), expand = FALSE) +
   scale_fill_viridis_c(name = "mm", option = "mako") +
   labs(x = NULL, y = NULL)
 ```
 
-### Makay area against WorldClim
+At this resolution the map resolves a marked gradient across the massif, with higher totals to the north-east and lower totals to the south-west.
 
-WorldClim is the only gridded product used here for the Makay boundary, and no station lies inside it. The table gives the monthly area mean over the Makay polygon, for the same months and for the 1970-2000 normal.
+### CHIRPS
 
-```{r}
-#| label: tbl-makay-wc
-#| tbl-cap: "WorldClim monthly precipitation averaged over the Makay polygon, November 2019 to October 2020, against the 1970-2000 normal. Totals are the sum of the twelve months."
-makay_v <- vect(makay)
-
-makay_wc <- tibble(
-  Month = focus_months,
-  `WorldClim 2019/20 (mm)` = as.numeric(terra::extract(wc_month, makay_v, fun = mean, na.rm = TRUE, exact = TRUE)[1, -1]),
-  normal_all = as.numeric(terra::extract(nrm, makay_v, fun = mean, na.rm = TRUE, exact = TRUE)[1, -1])
-) |>
-  mutate(`WorldClim 1970-2000 normal (mm)` = normal_all[month(Month)]) |>
-  select(-normal_all)
-
-makay_wc |>
-  mutate(
-    Month = mlab(Month),
-    `Difference (%)` = round(100 * (`WorldClim 2019/20 (mm)` - `WorldClim 1970-2000 normal (mm)`) / `WorldClim 1970-2000 normal (mm)`),
-    across(where(is.numeric) & !contains("%"), \(x) round(x, 1))
-  ) |>
-  bind_rows(
-    makay_wc |>
-      summarise(
-        Month = "Total",
-        `WorldClim 2019/20 (mm)` = round(sum(`WorldClim 2019/20 (mm)`), 1),
-        `WorldClim 1970-2000 normal (mm)` = round(sum(`WorldClim 1970-2000 normal (mm)`), 1)
-      ) |>
-      mutate(`Difference (%)` = round(100 * (`WorldClim 2019/20 (mm)` - `WorldClim 1970-2000 normal (mm)`) / `WorldClim 1970-2000 normal (mm)`))
-  ) |>
-  kable()
-```
-
-### CHIRPS gridded comparison
-
-CHIRPS is a gauge-satellite blend, so it is not an independent observation, but it covers the window fully and can be averaged over the Makay polygon, which no station can. The version used here is CHIRPS v2.0 monthly precipitation on a 0.05 degree grid. The twelve monthly GeoTIFFs for November 2019 to October 2020 were taken from a local S3 copy of the CHC product archive (`s3://projet-betsaka/PA-impact-deforestation/mapme/chirps/`), since the original CHC paths and the ERDDAP mirror used by `climateR` did not answer during testing.
+CHIRPS v2.0 monthly precipitation, 0.05 degree. The twelve monthly GeoTIFFs for the window were taken from a local S3 copy of the CHC product archive (`s3://projet-betsaka/PA-impact-deforestation/mapme/chirps/`), since the original CHC paths and the ERDDAP mirror used by `climateR` did not answer during testing.
 
 ```{r}
 #| label: chirps-download
@@ -640,82 +610,74 @@ chirps_stack <- rast(unlist(chirps_files))
 names(chirps_stack) <- format(focus_months, "%Y-%m")
 ```
 
-The Makay polygon mean uses cell areas as weights, since the polygon spans several cells. Station values are bilinear samples at the GHCN coordinates.
-
 ```{r}
-#| label: tbl-chirps-makay
-#| tbl-cap: "CHIRPS monthly precipitation averaged over the Makay polygon, November 2019 to October 2020, against WorldClim for the same window. Totals are the sum of the twelve months."
+#| label: chirps-makay
 e_makay <- terra::extract(chirps_stack, makay, weights = TRUE, exact = FALSE)
 wts <- e_makay$weight
 makay_chirps <- sapply(names(chirps_stack), \(n) weighted.mean(e_makay[[n]], wts))
+```
 
-makay_chirps_tbl <- tibble(
+### WorldClim
+
+The WorldClim historical monthly product for the window (5 arc-minute, CRU TS 4.09 based) and the 1970-2000 normal (30 arc-second), averaged over the Makay polygon with exact cell fractions.
+
+```{r}
+#| label: wc-makay
+makay_v <- vect(makay)
+makay_wc_1920 <- as.numeric(terra::extract(wc_month, makay_v, fun = mean, na.rm = TRUE, exact = TRUE)[1, -1])
+makay_normal <- as.numeric(terra::extract(nrm, makay_v, fun = mean, na.rm = TRUE, exact = TRUE)[1, -1])
+```
+
+### Monthly comparison and annual totals
+
+```{r}
+#| label: tbl-gridded-makay
+#| tbl-cap: "Monthly rainfall averaged over the Makay polygon, November 2019 to October 2020, from ENACTS v4, CHIRPS and WorldClim. The last row is the twelve-month total."
+gridded_cmp <- tibble(
   Month = focus_months,
+  `ENACTS v4 (mm)` = enacts_monthly$mm,
   `CHIRPS (mm)` = makay_chirps,
-  `WorldClim 2019/20 (mm)` = makay_wc$`WorldClim 2019/20 (mm)`
-) |>
-  mutate(
-    Month = mlab(Month),
-    across(where(is.numeric) & !contains("%"), \(x) round(x, 1))
-  ) |>
-  bind_rows(
-    tibble(
-      Month = "Total",
-      `CHIRPS (mm)` = round(sum(makay_chirps), 1),
-      `WorldClim 2019/20 (mm)` = round(sum(makay_wc$`WorldClim 2019/20 (mm)`), 1)
-    )
-  )
+  `WorldClim 2019/20 (mm)` = makay_wc_1920
+)
 
-makay_chirps_tbl |> kable()
+gridded_cmp |>
+  mutate(Month = mlab(Month), across(where(is.numeric), \(x) round(x, 1))) |>
+  bind_rows(gridded_cmp |> summarise(Month = "Total", across(where(is.numeric), \(x) round(sum(x), 1)))) |>
+  kable()
 ```
 
 ```{r}
-#| label: fig-chirps-stations
-#| fig-cap: "CHIRPS monthly precipitation sampled at the station coordinates, against the observed GHCN-Daily sums, November 2019 to October 2020. Observed sums are lower bounds because no month is complete."
-chirps_pts_meta <- station_meta |>
-  filter(source == "GHCN-Daily", wmo %in% focus_wmo) |>
-  distinct(wmo, .keep_all = TRUE)
-chirps_pts_sf <- st_as_sf(chirps_pts_meta, coords = c("lon", "lat"), crs = 4326)
-chirps_pts_tbl <- terra::extract(chirps_stack, chirps_pts_sf, method = "bilinear") |>
-  as.data.frame() |>
-  as_tibble() |>
-  mutate(wmo = chirps_pts_meta$wmo[as.integer(ID)]) |>
-  pivot_longer(-c(ID, wmo), names_to = "month", values_to = "CHIRPS (mm)") |>
-  mutate(month = as.Date(paste0(month, "-01")))
-
-chirps_cmp <- daily |>
-  filter(source == "GHCN-Daily", wmo %in% focus_wmo, date >= min(focus_months), date < focus_end) |>
-  mutate(month = floor_date(date, "month")) |>
-  summarise(
-    `Observed (mm)` = sum(prcp, na.rm = TRUE),
-    ndays = sum(!is.na(prcp)),
-    .by = c(wmo, month)
-  ) |>
-  left_join(chirps_pts_tbl, by = c("wmo", "month" = "month")) |>
-  left_join(distinct(station_meta, wmo, name), by = "wmo")
-
-chirps_cmp |>
-  filter(ndays > 0) |>
-  select(name, month, `Observed (mm)`, `CHIRPS (mm)`, ndays) |>
-  pivot_longer(c(`Observed (mm)`, `CHIRPS (mm)`), names_to = "Source", values_to = "mm") |>
-  ggplot(aes(month, mm, fill = Source)) +
-  geom_col(position = position_dodge()) +
-  facet_wrap(~name, ncol = 1) +
-  scale_x_date(breaks = focus_months, labels = \(x) mlab(x)) +
-  labs(x = NULL, y = "Monthly rainfall (mm)") +
+#| label: fig-gridded-monthly
+#| fig-cap: "Monthly rainfall averaged over the Makay polygon, November 2019 to October 2020, from ENACTS v4 and CHIRPS (solid) and WorldClim (dashed), with the WorldClim 1970-2000 normal for reference."
+#| fig-height: 5
+tibble(
+  month = focus_months,
+  `ENACTS v4` = enacts_monthly$mm,
+  CHIRPS = makay_chirps,
+  `WorldClim 2019/20` = makay_wc_1920,
+  `WorldClim 1970-2000 normal` = makay_normal[month(focus_months)]
+) |>
+  pivot_longer(-month, names_to = "product", values_to = "mm") |>
+  ggplot(aes(month, mm, color = product, linetype = product)) +
+  geom_line() +
+  geom_point(size = 1.8) +
+  scale_x_date(breaks = focus_months, labels = \(x) mlab(x) |> str_replace(" 20(\\d\\d)$", " '\\1")) +
+  labs(x = NULL, y = "Rainfall over the Makay polygon (mm)", color = NULL, linetype = NULL) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-chirps_corr <- cor(chirps_cmp$`CHIRPS (mm)`, chirps_cmp$`Observed (mm)`)
-chirps_bias <- mean(chirps_cmp$`CHIRPS (mm)` - chirps_cmp$`Observed (mm)`)
-chirps_total <- sum(makay_chirps)
-wc_total <- sum(makay_wc$`WorldClim 2019/20 (mm)`)
-chirps_wc_gap <- 100 * (chirps_total - wc_total) / wc_total
-chirps_maxdiff <- max(abs(makay_chirps - makay_wc$`WorldClim 2019/20 (mm)`))
 ```
 
-Over the 17 station-months with observations, the CHIRPS sample correlates with the observed sums at r = `r round(chirps_corr, 2)` (Pearson), and CHIRPS is higher on average by about `r round(chirps_bias)` mm per month. The direction of that gap is expected, since the observed sums omit unobserved days, but the gap is not uniform: it is small at Ranohira throughout the wet season and largest at Morondava in January 2020, where the observed sum already exceeds CHIRPS. As with WorldClim, the data cannot separate station error from grid error.
+```{r}
+#| label: gridded-stats
+enacts_total_mm <- sum(enacts_monthly$mm)
+chirps_total_mm <- sum(makay_chirps)
+wc_total_mm <- sum(makay_wc_1920)
+en_ch_r <- cor(enacts_monthly$mm, makay_chirps)
+en_ch_maxdiff <- max(abs(enacts_monthly$mm - makay_chirps))
+en_wc_gap <- 100 * (enacts_total_mm - wc_total_mm) / wc_total_mm
+en_ch_gap <- 100 * (enacts_total_mm - chirps_total_mm) / chirps_total_mm
+```
 
-Over the Makay polygon, CHIRPS gives a window total of `r round(chirps_total)` mm against the WorldClim 2019/20 total of `r round(wc_total)` mm, about `r round(chirps_wc_gap)`% lower. The two products agree on the shape of the season (peaks in December to February, near-zero June to September) but differ by up to about `r round(chirps_maxdiff)` mm in individual months, most visibly in January 2020.
+Over the window, ENACTS v4 gives `r round(enacts_total_mm)` mm and CHIRPS `r round(chirps_total_mm)` mm, about `r round(abs(en_ch_gap))`% apart, with a monthly correlation of `r round(en_ch_r, 2)` and no monthly difference above about `r round(en_ch_maxdiff)` mm. WorldClim 2019/20 gives `r round(wc_total_mm)` mm, about `r round(abs(en_wc_gap))`% more than either, and its 1970-2000 normal over the polygon is `r round(sum(makay_normal))` mm, so the CRU-based product sees the window as near-normal while ENACTS and CHIRPS see a drier one. All three agree on the shape of the season (wet November to March, peak in January, near-zero May to September) but differ at the edges: ENACTS has the most rain in February of the three, WorldClim the most in December and March.
 
 ## Coverage over 1991-2020
 
@@ -765,21 +727,6 @@ year_coverage |>
   labs(x = NULL, y = NULL, fill = "% days observed")
 ```
 
-```{r}
-#| label: tbl-year-thresholds
-#| tbl-cap: "Number of years in 1991-2020 meeting each completeness threshold (out of 30)."
-annual |>
-  filter(year %in% clim_years) |>
-  group_by(source, name) |>
-  summarise(
-    years_ge50 = sum(n_obs >= 0.5 * days_in_year),
-    years_ge80 = sum(n_obs >= 0.8 * days_in_year),
-    years_ge90 = sum(complete),
-    .groups = "drop"
-  ) |>
-  arrange(source, desc(years_ge80)) |>
-  kable(col.names = c("Source", "Station", "Years >=50% obs", "Years >=80% obs", "Years >=90% obs"))
-```
 
 Annual totals are not reported as normals: no station has a year with at least 90% of days observed in 1991-2020, and few years meet 80%. Annual sums from years below that level would be biased low.
 
@@ -852,24 +799,6 @@ paired |>
   kable()
 ```
 
-## Summary of the nearest stations
-
-```{r}
-#| label: tbl-summary
-#| tbl-cap: "Nearest stations with their distance, record end and coverage over 1991-2020."
-station_meta |>
-  transmute(source, name, wmo, dist_km = round(dist_km), elev) |>
-  left_join(coverage |> select(source, wmo, first_obs, last_obs, pct_obs_1991_2020), by = c("source", "wmo")) |>
-  left_join(
-    annual |>
-      filter(year %in% clim_years) |>
-      group_by(source, wmo) |>
-      summarise(years_ge80 = sum(n_obs >= 0.8 * days_in_year), .groups = "drop"),
-    by = c("source", "wmo")
-  ) |>
-  arrange(dist_km) |>
-  kable(col.names = c("Source", "Station", "WMO", "Distance (km)", "Elevation (m)", "First obs", "Last obs", "% days obs 1991-2020", "Years >=80% obs 1991-2020"))
-```
 
 ## Assessment
 
@@ -879,28 +808,28 @@ Open access, no key or registration, plain CSV per station. The station list, in
 
 ### Meteostat
 
-The bulk daily files (`bulk.meteostat.net`) and station index download without a key, which is what this document uses; the API was not tested. In the focus window, the Meteostat values are identical to GHCN-Daily on every day both sources observe, so Meteostat adds convenience and a longer recent series rather than a separate network. The station index lists some Malagasy stations with inventory end dates in 2027, which is after the date of this analysis, and the observed series end in March 2026, so the index dates are not reliable and were not used. Confirm the licence and attribution terms on meteostat.net before redistributing.
+The bulk daily files and station index download without a key. On every day both sources observe, the Meteostat values are identical to GHCN-Daily, so Meteostat adds convenience and a longer recent series rather than a separate network. Its observed series ends in March 2026, beyond GHCN-Daily's end date, but that extension was not verified independently. Confirm the licence and attribution terms on meteostat.net before redistributing.
 
-### Meteo Madagascar (IRI Data Library)
+### ENACTS v4 (Meteo Madagascar / IRI Data Library)
 
-The site is reachable (HTTP 200 on the home page and the monthly rainfall branch) and states that data can be downloaded free of charge, including in GIS-compatible formats. The monthly rainfall branch (`.Madagascar_v3/.ALL/.monthly/.rainfall/`) holds one dataset, `.rfe`. Its metadata describes a gridded product on a 0.0375 degree grid, covering January 1981 to August 2020, in mm. It is therefore a gridded estimate rather than station records, and it is excluded from the station comparison. It also stops before September 2020, so it cannot cover the full window. Whether its source is satellite, gauge-based or a blend was not established. The daily and dekadal branches were not inspected, so whether Meteo Madagascar holds station-level records is not established.
+The maproom is reachable and serves the ENACTS family: gridded rainfall (`rfe`) on a 0.0375 degree grid. The v4 daily file covers the focus window completely, with no missing day or cell over the Makay box, and at about 4 km it is the finest grid of the three products compared. Its blend of station and satellite inputs could not be verified, because the IRI Data Library catalog now requires sign-in and the file metadata carries no provenance beyond the variable name and units. Whether Meteo Madagascar also serves station-level records was not established.
 
 ### WorldClim
 
-The historical monthly product covers every month of the window at 5 arc-minute resolution. It is interpolated and gridded, so it is not an observation, and each station value is one grid cell. Because the observed sums are partial, most station-months fall below WorldClim (12 of 17 with observations), which is expected from missing days. In the other 5, the observed sum already exceeds WorldClim (see the check table). Those cases point to WorldClim being too low for the cell, to an error in the station values, or to both, and the data here cannot separate these.
+WorldClim is interpolated from station data and is not an observation. Over the Makay polygon it gives about 17% more rain than ENACTS v4 or CHIRPS for the window, and its 2019/20 monthly values sit close to its own 1970-2000 normal, so by CRU the window was near-normal. With few stations near the Makay feeding CRU, that gap may reflect sparse input data as much as real rainfall. At the stations, 12 of the 17 observed station-months fall below WorldClim, which is expected from missing days; in the other 5 the observed sum already exceeds WorldClim (see the check table). Those cases point to WorldClim being too low for the cell, to an error in the station values, or to both, and the data here cannot separate these.
 
 ### CHIRPS
 
-CHIRPS v2.0 monthly (0.05 degree) covers the full window and answers without a key, in this case through a local S3 copy of the CHC archive; the CHC paths and the ERDDAP mirror used by `climateR` did not answer during testing. It is a gauge-satellite blend, so it does not validate the station records independently, but it is the only gridded product here that covers the window month by month. Sampled at the stations it tracks the observed month-to-month variation closely (r = 0.94 over 17 station-months), and over the Makay polygon it gives a window total about 16% below WorldClim. Confirm the CHIRPS licence and preferred citation (Funk et al. 2015) before redistribution.
+CHIRPS v2.0 monthly tracks ENACTS v4 closely over the Makay polygon: window totals about 1% apart, monthly correlation 0.98, and the same season shape. As a gauge-satellite blend it is not an independent observation either, but the agreement of two separately produced estimates supports the lower total of roughly 870 mm for the window. Confirm the CHIRPS licence and preferred citation (Funk et al. 2015) before redistribution.
 
 ## Limitations
 
 - No station lies inside or adjacent to the Makay boundary. The nearest records (Ranohira, Morondava) are about 85 km and 115 km away, and their 1991-2020 observed coverage is 15% and 20% of days.
-- In the focus window, no month at any of the three stations is complete enough to give a station monthly total. The observed sums in the comparison are lower bounds, so the check can show where WorldClim is too low, but not where it is too high.
+- In the focus window, no month at any of the three stations is complete enough to give a station monthly total, so the station evidence cannot say how much rain fell over the Makay. The observed sums are lower bounds, so the check against WorldClim can show where WorldClim is too low, but not where it is too high.
+- The gridded products disagree by about 17% on the window total over the Makay (ENACTS v4 and CHIRPS near 870 mm, WorldClim near 1045 mm) and by up to about 43 mm in individual months. Without rainfall measurements inside the polygon there is no way to tell which product is closer to the truth; the ENACTS-CHIRPS agreement is the best available support for the lower figure.
+- The ENACTS v4 blend inputs (station network, satellite source) could not be verified, and the file covers only the downloaded box around the Makay.
 - Morombe has no observed day in the window, so there is no station evidence for the coastal stretch around Morombe during the focus period.
-- Makay is listed as "Proposed" in WDPA Nov 2026, so the boundary may still change.
 - Beroroha has no record in GHCN-Daily or Meteostat. A station record for it would need Meteo Madagascar's station network or Malagasy meteorological records.
+- Makay is listed as "Proposed" in WDPA Nov 2026, so the boundary may still change.
 - Completeness thresholds (80% for months, 90% for years) are working choices.
-- No statistical testing is performed here; the aim is to describe availability and coverage.
-
-<SUGGESTION>Check Meteo Madagascar's daily and dekadal branches for station-level rainfall records near Beroroha and Makay.</SUGGESTION>
+- No statistical testing is performed here; the aim is to describe availability and compare products descriptively.

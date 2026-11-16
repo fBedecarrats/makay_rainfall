@@ -1,0 +1,10 @@
+# Data and large files
+data/
+data.nc
+*.zip
+*.kml
+
+# Rendered outputs (index.html is kept for GitHub Pages)
+*.pdf
+.quarto/
+extent_comparison.html
